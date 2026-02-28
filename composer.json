@@ -1,0 +1,40 @@
+{
+    "name": "web3php/web3php",
+    "description": "Multi-blockchain PHP integration library. Ethereum, Bitcoin, Solana, Tron, Polygon, BSC, Avalanche, Arbitrum, Optimism, Base and more. Includes FakeChain for local testing.",
+    "type": "library",
+    "version": "1.0.0",
+    "license": "MIT",
+    "keywords": ["blockchain", "ethereum", "bitcoin", "solana", "tron", "web3", "polygon", "bsc", "evm", "crypto", "fakechain"],
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0"
+    },
+    "suggest": {
+        "ext-bcmath": "Recomendado para aritmética de precisão com saldos e unidades grandes",
+        "kornrunner/keccak": "Necessário para endereços EIP-55 checksum e ABI encoding correto: composer require kornrunner/keccak",
+        "kornrunner/ethereum-offline-raw-tx": "Necessário para assinar transações EVM no servidor"
+    },
+    "autoload": {
+        "psr-4": {
+            "Web3PHP\\": "src/",
+            "FakeChain\\": "src/"
+        },
+        "files": [
+            "src/Web3PHP.php",
+            "src/FakeChain.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit tests/"
+    },
+    "minimum-stability": "stable"
+}
