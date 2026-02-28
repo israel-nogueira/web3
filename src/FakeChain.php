@@ -24,7 +24,7 @@ $fixes = 0;
 // FIX 1 — Propriedade de classe com str_repeat()
 //
 // ANTES:
-//   public string $minerAddress = '0xffffffffffffffffffffffffffffffffffffffff';
+//   public string $minerAddress = '0x' . str_repeat('f', 40);
 //
 // DEPOIS:
 //   public string $minerAddress = '0xffffffffffffffffffffffffffffffffffffffff';
@@ -46,7 +46,7 @@ if (str_contains($src, $before1)) {
 // FIX 2 — Parâmetro padrão de método com str_repeat()
 //
 // ANTES:
-//   public function mine(string $minerAddress = '0x0111111111111111111111111111111111111111'): array
+//   public function mine(string $minerAddress = '0x' . '0' . str_repeat('1', 39)): array
 //
 // DEPOIS:
 //   public function mine(string $minerAddress = '0x0111111111111111111111111111111111111111'): array
