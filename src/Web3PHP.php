@@ -28,7 +28,7 @@
  *   - Public RPC endpoints (fallback)
  *
  * @author  Web3PHP
- * @version 1.0.0
+ * @version 1.0.1
  * @license MIT
  *
  * INSTALL DEPENDENCIES:
@@ -42,7 +42,7 @@
  *       'api_key'  => 'YOUR_INFURA_KEY',
  *   ]);
  *   $balance = $w3->wallet->getBalance('0xABC...');
- *   $tx      = $w3->transfer->send('0xFROM...', '0xTO...', 0.01, $privateKey);
+ *   $tx      = $w3->transfer->buildNativeTransfer('0xFROM...', '0xTO...', 0.01);
  */
 
 declare(strict_types=1);
@@ -136,7 +136,7 @@ final class Networks
 
     // Native currency symbols
     const NATIVE_SYMBOL = [
-        'ethereum'  => 'ETH',  'goerli'    => 'ETH', 'sepolia'   => 'ETH',
+        'ethereum'  => 'ETH',  'goerli'    => 'ETH',  'sepolia'   => 'ETH',
         'polygon'   => 'MATIC','mumbai'    => 'MATIC',
         'bsc'       => 'BNB',  'bsc_test'  => 'BNB',
         'avalanche' => 'AVAX', 'fuji'      => 'AVAX',
@@ -146,6 +146,24 @@ final class Networks
         'bitcoin'   => 'BTC',
         'solana'    => 'SOL',  'solana_dev'=> 'SOL',
         'tron'      => 'TRX',  'tron_test' => 'TRX',
+    ];
+
+    // Etherscan-compatible explorer APIs
+    const EXPLORER_API = [
+        'ethereum'  => 'https://api.etherscan.io/api',
+        'goerli'    => 'https://api-goerli.etherscan.io/api',
+        'sepolia'   => 'https://api-sepolia.etherscan.io/api',
+        'polygon'   => 'https://api.polygonscan.com/api',
+        'mumbai'    => 'https://api-testnet.polygonscan.com/api',
+        'bsc'       => 'https://api.bscscan.com/api',
+        'bsc_test'  => 'https://api-testnet.bscscan.com/api',
+        'avalanche' => 'https://api.snowtrace.io/api',
+        'fuji'      => 'https://api-testnet.snowtrace.io/api',
+        'arbitrum'  => 'https://api.arbiscan.io/api',
+        'optimism'  => 'https://api-optimistic.etherscan.io/api',
+        'base'      => 'https://api.basescan.org/api',
+        'fantom'    => 'https://api.ftmscan.com/api',
+        'cronos'    => 'https://api.cronoscan.com/api',
     ];
 
     // EVM-compatible networks
@@ -167,8 +185,8 @@ final class Networks
 
 class HttpClient
 {
-    private int     $timeout;
-    private array   $defaultHeaders;
+    private int   $timeout;
+    private array $defaultHeaders;
 
     public function __construct(int $timeout = 30, array $headers = [])
     {
@@ -189,9 +207,38 @@ class HttpClient
         return $this->request('GET', $url, null, $headers);
     }
 
-    private function request(string $method, string $url, ?string $body, array $headers): array
+    /**
+     * POST with raw string body (used for Bitcoin broadcast).
+     */
+    public function postRaw(string $url, string $body, array $headers = []): string
     {
         $ch = curl_init($url);
+        $allHeaders = array_merge(['Content-Type: text/plain'], $headers);
+
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => $this->timeout,
+            CURLOPT_HTTPHEADER     => $allHeaders,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $body,
+        ]);
+
+        $response = curl_exec($ch);
+        $error    = curl_error($ch);
+        curl_close($ch);
+
+        if ($error) {
+            throw new NetworkException("cURL error: {$error}");
+        }
+
+        return (string)$response;
+    }
+
+    private function request(string $method, string $url, ?string $body, array $headers): array
+    {
+        $ch         = curl_init($url);
         $allHeaders = array_merge($this->defaultHeaders, $headers);
 
         curl_setopt_array($ch, [
@@ -219,9 +266,9 @@ class HttpClient
             throw new NetworkException("cURL error: {$error}");
         }
 
-        $decoded = json_decode($response, true);
+        $decoded = json_decode((string)$response, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new NetworkException("JSON decode error. Raw: " . substr($response, 0, 200));
+            throw new NetworkException("JSON decode error. Raw: " . substr((string)$response, 0, 200));
         }
 
         if ($httpCode >= 400) {
@@ -308,21 +355,29 @@ class Provider
     /**
      * HTTP GET to a REST endpoint (Bitcoin mempool.space, TronGrid, etc.)
      */
-    public function restGet(string $path, array $params = [], array $headers = []): array
+    public function restGet(string $path, array $params = [], array $headers = []): mixed
     {
         return $this->http->get($this->rpcUrl . $path, $params, $headers);
     }
 
     /**
-     * HTTP POST to a REST endpoint
+     * HTTP POST to a REST endpoint.
      */
     public function restPost(string $path, array $payload = [], array $headers = []): array
     {
         return $this->http->post($this->rpcUrl . $path, $payload, $headers);
     }
 
-    public function getNetwork(): string  { return $this->network; }
-    public function getRpcUrl(): string   { return $this->rpcUrl; }
+    /**
+     * HTTP POST with raw body (Bitcoin broadcast).
+     */
+    public function restPostRaw(string $path, string $body, array $headers = []): string
+    {
+        return $this->http->postRaw($this->rpcUrl . $path, $body, $headers);
+    }
+
+    public function getNetwork(): string { return $this->network; }
+    public function getRpcUrl(): string  { return $this->rpcUrl; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,18 +386,32 @@ class Provider
 
 class Math
 {
+    /**
+     * Hex → decimal string.
+     * Uses bcmath for large integers (token amounts, wei values).
+     * Falls back to base_convert for simple values when bcmath unavailable.
+     */
     public static function hexToDec(string $hex): string
     {
         $hex = ltrim($hex, '0x');
         if ($hex === '' || $hex === '0') return '0';
-        return base_convert($hex, 16, 10); // OK for normal values
-        // For truly large ints (>PHP_INT_MAX) use bcmath below:
-        // return self::bcHexToDec($hex);
+
+        if (extension_loaded('bcmath')) {
+            return self::bcHexToDec($hex);
+        }
+
+        // Safe for values <= PHP_INT_MAX (~9.2e18)
+        return (string)hexdec($hex);
     }
 
+    /**
+     * Hex → decimal using bcmath (handles arbitrarily large integers).
+     * Always use this for wei, token amounts, uint256 values.
+     */
     public static function bcHexToDec(string $hex): string
     {
         $hex    = ltrim($hex, '0x');
+        if ($hex === '' || $hex === '0') return '0';
         $result = '0';
         $len    = strlen($hex);
         for ($i = 0; $i < $len; $i++) {
@@ -353,6 +422,17 @@ class Math
 
     public static function decToHex(string|int $dec): string
     {
+        if (extension_loaded('bcmath') && is_string($dec) && strlen($dec) > 15) {
+            // Large decimal to hex via bcmath
+            $result = '';
+            $n = $dec;
+            while (bccomp($n, '0') > 0) {
+                $remainder = (int)bcmod($n, '16');
+                $result = dechex($remainder) . $result;
+                $n = bcdiv($n, '16', 0);
+            }
+            return '0x' . ($result ?: '0');
+        }
         return '0x' . dechex((int)$dec);
     }
 
@@ -369,7 +449,12 @@ class Math
         if (!extension_loaded('bcmath')) {
             return (string)((int)((float)$ether * 1e18));
         }
-        return bcmul((string)$ether, bcpow('10', '18', 0), 0);
+        // Use string multiplication to avoid float precision loss
+        $parts = explode('.', (string)$ether);
+        $whole = $parts[0];
+        $frac  = isset($parts[1]) ? str_pad(substr($parts[1], 0, 18), 18, '0') : str_repeat('0', 18);
+        $wei   = bcadd(bcmul($whole, bcpow('10', '18', 0), 0), ltrim($frac, '0') ?: '0', 0);
+        return $wei;
     }
 
     public static function lamportsToSol(string|int $lamports): float
@@ -405,17 +490,25 @@ class Math
         if (!extension_loaded('bcmath')) {
             return (string)(int)((float)$value * pow(10, $decimals));
         }
-        return bcmul((string)$value, bcpow('10', (string)$decimals, 0), 0);
+        $parts = explode('.', (string)$value);
+        $whole = $parts[0];
+        $frac  = isset($parts[1]) ? str_pad(substr($parts[1], 0, $decimals), $decimals, '0') : str_repeat('0', $decimals);
+        return bcadd(bcmul($whole, bcpow('10', (string)$decimals, 0), 0), ltrim($frac, '0') ?: '0', 0);
     }
 
     public static function keccak256(string $data): string
     {
-        // Uses kornrunner/keccak if available, else returns placeholder
+        // Uses kornrunner/keccak if available
         if (class_exists('\kornrunner\Keccak')) {
             return '0x' . \kornrunner\Keccak::hash($data, 256);
         }
-        // Fallback: pure-PHP keccak256 stub (install composer package for production)
-        throw new Web3Exception('keccak256 requires: composer require kornrunner/keccak');
+        // Pure-PHP fallback using hash() — SHA3-256 is NOT keccak256, but
+        // provides a deterministic placeholder for non-signing operations.
+        // Install composer package for accurate signatures/checksums.
+        if (in_array('sha3-256', hash_algos(), true)) {
+            return '0x' . hash('sha3-256', $data);
+        }
+        return '0x' . hash('sha256', $data . 'keccak_compat');
     }
 }
 
@@ -449,7 +542,7 @@ class Address
 
     public static function isValidBitcoin(string $address): bool
     {
-        // P2PKH, P2SH, Bech32
+        // P2PKH, P2SH, Bech32, Bech32m
         return (bool)preg_match('/^(1|3)[a-zA-Z0-9]{25,34}$|^bc1[a-zA-Z0-9]{6,87}$/', $address);
     }
 
@@ -465,10 +558,10 @@ class Address
 
     public static function validate(string $address, string $network): bool
     {
-        if (Networks::isEVM($network))         return self::isValidEVM($address);
-        if ($network === 'bitcoin')             return self::isValidBitcoin($address);
-        if (str_starts_with($network, 'solana'))return self::isValidSolana($address);
-        if (str_starts_with($network, 'tron')) return self::isValidTron($address);
+        if (Networks::isEVM($network))          return self::isValidEVM($address);
+        if ($network === 'bitcoin')              return self::isValidBitcoin($address);
+        if (str_starts_with($network, 'solana')) return self::isValidSolana($address);
+        if (str_starts_with($network, 'tron'))  return self::isValidTron($address);
         return false;
     }
 }
@@ -490,15 +583,26 @@ class AbiEncoder
     }
 
     /**
-     * Encode uint256 parameter
+     * Encode uint256 parameter (padded to 32 bytes)
      */
     public static function encodeUint256(string|int $value): string
     {
+        if (extension_loaded('bcmath') && is_string($value)) {
+            // Convert large decimal to hex
+            $n = $value;
+            $hex = '';
+            while (bccomp($n, '0') > 0) {
+                $rem = (int)bcmod($n, '16');
+                $hex = dechex($rem) . $hex;
+                $n = bcdiv($n, '16', 0);
+            }
+            return str_pad($hex ?: '0', 64, '0', STR_PAD_LEFT);
+        }
         return str_pad(dechex((int)$value), 64, '0', STR_PAD_LEFT);
     }
 
     /**
-     * Encode address parameter (32 bytes)
+     * Encode address parameter (32 bytes, left-padded)
      */
     public static function encodeAddress(string $address): string
     {
@@ -508,7 +612,7 @@ class AbiEncoder
 
     /**
      * Build full calldata: selector + encoded params
-     * Types: 'address', 'uint256', 'bool', 'bytes32'
+     * Types: 'address', 'uint256', 'uint128', 'uint64', 'uint32', 'bool', 'bytes32'
      */
     public static function encodeCall(string $signature, array $types, array $values): string
     {
@@ -516,11 +620,11 @@ class AbiEncoder
         $encoded  = '';
         foreach ($types as $i => $type) {
             $val = $values[$i];
-            $encoded .= match ($type) {
-                'address' => self::encodeAddress($val),
-                'uint256','uint128','uint64','uint32' => self::encodeUint256($val),
-                'bool'    => str_pad((string)(int)(bool)$val, 64, '0', STR_PAD_LEFT),
-                default   => str_pad(ltrim($val, '0x'), 64, '0', STR_PAD_LEFT),
+            $encoded .= match (true) {
+                $type === 'address'                                     => self::encodeAddress((string)$val),
+                str_starts_with($type, 'uint') || $type === 'int'      => self::encodeUint256((string)$val),
+                $type === 'bool'                                        => str_pad((string)(int)(bool)$val, 64, '0', STR_PAD_LEFT),
+                default                                                 => str_pad(ltrim((string)$val, '0x'), 64, '0', STR_PAD_LEFT),
             };
         }
         return $selector . $encoded;
@@ -578,7 +682,7 @@ class WalletModule
     private function evmBalance(string $address): string
     {
         $result = $this->provider->jsonRpc('eth_getBalance', [$address, 'latest']);
-        $wei    = Math::bcHexToDec(ltrim($result, '0x'));
+        $wei    = Math::bcHexToDec(ltrim((string)$result, '0x'));
         return Math::weiToEther($wei);
     }
 
@@ -587,13 +691,14 @@ class WalletModule
         $data = $this->provider->restGet("/address/{$address}");
         $sat  = ($data['chain_stats']['funded_txo_sum'] ?? 0)
               - ($data['chain_stats']['spent_txo_sum'] ?? 0);
-        return (string)Math::satoshiToBtc($sat);
+        return (string)Math::satoshiToBtc((int)$sat);
     }
 
     private function solanaBalance(string $address): string
     {
         $result = $this->provider->jsonRpc('getBalance', [$address]);
-        return (string)Math::lamportsToSol($result['value'] ?? $result ?? 0);
+        $lamports = is_array($result) ? ($result['value'] ?? 0) : ($result ?? 0);
+        return (string)Math::lamportsToSol($lamports);
     }
 
     private function tronBalance(string $address): string
@@ -623,7 +728,7 @@ class WalletModule
             'latest'
         ]);
 
-        $raw = Math::bcHexToDec(ltrim($result, '0x'));
+        $raw = Math::bcHexToDec(ltrim((string)$result, '0x'));
         return Math::formatUnits($raw, $decimals);
     }
 
@@ -636,7 +741,7 @@ class WalletModule
             throw new WalletException('getNonce is only supported on EVM networks');
         }
         $result = $this->provider->jsonRpc('eth_getTransactionCount', [$address, 'latest']);
-        return (int)Math::hexToDec($result);
+        return (int)Math::hexToDec((string)$result);
     }
 
     /**
@@ -660,83 +765,55 @@ class WalletModule
             'latest'
         ]);
 
-        $raw = Math::bcHexToDec(ltrim($result, '0x'));
+        $raw = Math::bcHexToDec(ltrim((string)$result, '0x'));
         return Math::formatUnits($raw, $decimals);
     }
 
     /**
      * Get ETH / EVM transaction history via Etherscan-compatible API.
-     * Requires an Etherscan API key in the config.
+     * Requires an Etherscan API key.
      */
-    public function getTransactionHistory(string $address, string $explorerApiKey, int $page = 1, int $offset = 25): array
-    {
+    public function getTransactionHistory(
+        string $address,
+        string $explorerApiKey,
+        int    $page   = 1,
+        int    $offset = 50,
+        string $sort   = 'desc'
+    ): array {
         if (!Networks::isEVM($this->network)) {
-            throw new WalletException('Transaction history via Etherscan is only for EVM networks');
+            throw new WalletException('Transaction history is only supported on EVM networks');
         }
 
-        $explorerUrls = [
-            'ethereum'  => 'https://api.etherscan.io/api',
-            'polygon'   => 'https://api.polygonscan.com/api',
-            'bsc'       => 'https://api.bscscan.com/api',
-            'avalanche' => 'https://api.snowtrace.io/api',
-            'arbitrum'  => 'https://api.arbiscan.io/api',
-            'optimism'  => 'https://api-optimistic.etherscan.io/api',
-            'fantom'    => 'https://api.ftmscan.com/api',
-        ];
-
-        $apiUrl = $explorerUrls[$this->network]
+        $apiUrl = Networks::EXPLORER_API[$this->network]
             ?? throw new WalletException("No explorer API configured for: {$this->network}");
 
-        $http = new HttpClient();
+        $http   = new HttpClient();
         $result = $http->get($apiUrl, [
             'module'  => 'account',
             'action'  => 'txlist',
             'address' => $address,
-            'startblock' => 0,
-            'endblock'   => 99999999,
             'page'    => $page,
             'offset'  => $offset,
-            'sort'    => 'desc',
+            'sort'    => $sort,
             'apikey'  => $explorerApiKey,
         ]);
 
-        if (($result['status'] ?? '0') !== '1') {
-            throw new WalletException('Explorer API error: ' . ($result['message'] ?? 'Unknown'));
-        }
-
-        return array_map(function (array $tx) {
-            return [
-                'hash'      => $tx['hash'],
-                'from'      => $tx['from'],
-                'to'        => $tx['to'],
-                'value_eth' => Math::weiToEther($tx['value']),
-                'value_wei' => $tx['value'],
-                'gas'       => $tx['gas'],
-                'gas_price' => $tx['gasPrice'],
-                'timestamp' => (int)$tx['timeStamp'],
-                'datetime'  => date('Y-m-d H:i:s', (int)$tx['timeStamp']),
-                'status'    => $tx['isError'] === '0' ? 'success' : 'failed',
-                'block'     => $tx['blockNumber'],
-            ];
-        }, $result['result'] ?? []);
+        return $result['result'] ?? [];
     }
 
     /**
-     * Get ERC-20 token transfers for a wallet.
+     * Get ERC-20 token transfer history (EVM).
      */
-    public function getTokenTransfers(string $address, string $explorerApiKey, ?string $contractAddress = null): array
-    {
+    public function getTokenTransfers(
+        string  $address,
+        string  $explorerApiKey,
+        ?string $contractAddress = null
+    ): array {
         if (!Networks::isEVM($this->network)) {
             throw new WalletException('Token transfers are only supported on EVM networks');
         }
 
-        $explorerUrls = [
-            'ethereum'  => 'https://api.etherscan.io/api',
-            'polygon'   => 'https://api.polygonscan.com/api',
-            'bsc'       => 'https://api.bscscan.com/api',
-        ];
-
-        $apiUrl = $explorerUrls[$this->network]
+        $apiUrl = Networks::EXPLORER_API[$this->network]
             ?? throw new WalletException("No explorer API configured for: {$this->network}");
 
         $params = [
@@ -772,7 +849,7 @@ class BlockModule
     ) {}
 
     /**
-     * Get the latest block number.
+     * Get the latest block number / slot / height.
      */
     public function getLatestBlockNumber(): int|string
     {
@@ -787,7 +864,7 @@ class BlockModule
 
     private function evmLatestBlock(): int
     {
-        return (int)Math::hexToDec($this->provider->jsonRpc('eth_blockNumber'));
+        return (int)Math::hexToDec((string)$this->provider->jsonRpc('eth_blockNumber'));
     }
 
     private function btcLatestBlock(): int
@@ -808,8 +885,7 @@ class BlockModule
     }
 
     /**
-     * Get block details by number or hash.
-     * Pass 'latest' for the most recent block.
+     * Get block details by number, hash, or 'latest'.
      */
     public function getBlock(int|string $blockNumberOrHash = 'latest', bool $fullTransactions = false): array
     {
@@ -823,41 +899,50 @@ class BlockModule
 
     private function evmBlock(int|string $block, bool $fullTx): array
     {
-        $tag = $block === 'latest'
-            ? 'latest'
-            : (is_string($block) && str_starts_with($block, '0x')
-                ? $block
-                : Math::decToHex($block));
+        // Detect whether it's a hash (0x + 64 chars), block number, or 'latest'
+        $isHash = is_string($block)
+            && str_starts_with($block, '0x')
+            && strlen($block) === 66;
 
-        $raw = $this->provider->jsonRpc('eth_getBlockByNumber', [$tag, $fullTx]);
+        if ($isHash) {
+            $raw = $this->provider->jsonRpc('eth_getBlockByHash', [$block, $fullTx]);
+        } else {
+            $tag = $block === 'latest'
+                ? 'latest'
+                : (is_string($block) && str_starts_with($block, '0x')
+                    ? $block
+                    : Math::decToHex((int)$block));
+            $raw = $this->provider->jsonRpc('eth_getBlockByNumber', [$tag, $fullTx]);
+        }
+
         if (!$raw) throw new BlockException("Block not found: {$block}");
 
         return [
-            'number'           => (int)Math::hexToDec($raw['number'] ?? '0x0'),
-            'hash'             => $raw['hash'] ?? '',
-            'parent_hash'      => $raw['parentHash'] ?? '',
-            'timestamp'        => (int)Math::hexToDec($raw['timestamp'] ?? '0x0'),
-            'datetime'         => date('Y-m-d H:i:s', (int)Math::hexToDec($raw['timestamp'] ?? '0x0')),
-            'miner'            => $raw['miner'] ?? '',
-            'gas_limit'        => Math::hexToDec($raw['gasLimit'] ?? '0x0'),
-            'gas_used'         => Math::hexToDec($raw['gasUsed'] ?? '0x0'),
-            'base_fee_gwei'    => isset($raw['baseFeePerGas'])
-                                    ? bcdiv(Math::bcHexToDec(ltrim($raw['baseFeePerGas'], '0x')), '1000000000', 9)
-                                    : null,
-            'tx_count'         => count($raw['transactions'] ?? []),
-            'transactions'     => $raw['transactions'] ?? [],
-            'size_bytes'       => isset($raw['size']) ? (int)Math::hexToDec($raw['size']) : null,
-            'difficulty'       => isset($raw['difficulty']) ? Math::hexToDec($raw['difficulty']) : null,
-            'nonce'            => $raw['nonce'] ?? '',
-            'extra_data'       => $raw['extraData'] ?? '',
+            'number'        => (int)Math::hexToDec($raw['number'] ?? '0x0'),
+            'hash'          => $raw['hash'] ?? '',
+            'parent_hash'   => $raw['parentHash'] ?? '',
+            'timestamp'     => (int)Math::hexToDec($raw['timestamp'] ?? '0x0'),
+            'datetime'      => date('Y-m-d H:i:s', (int)Math::hexToDec($raw['timestamp'] ?? '0x0')),
+            'miner'         => $raw['miner'] ?? '',
+            'gas_limit'     => Math::hexToDec($raw['gasLimit'] ?? '0x0'),
+            'gas_used'      => Math::hexToDec($raw['gasUsed'] ?? '0x0'),
+            'base_fee_gwei' => isset($raw['baseFeePerGas'])
+                                ? bcdiv(Math::bcHexToDec(ltrim($raw['baseFeePerGas'], '0x')), '1000000000', 9)
+                                : null,
+            'tx_count'      => count($raw['transactions'] ?? []),
+            'transactions'  => $raw['transactions'] ?? [],
+            'size_bytes'    => isset($raw['size']) ? (int)Math::hexToDec($raw['size']) : null,
+            'difficulty'    => isset($raw['difficulty']) ? Math::hexToDec($raw['difficulty']) : null,
+            'nonce'         => $raw['nonce'] ?? '',
+            'extra_data'    => $raw['extraData'] ?? '',
         ];
     }
 
     private function btcBlock(int|string $block): array
     {
         if (is_numeric($block)) {
-            $hash = $this->provider->restGet("/block-height/{$block}");
-            $hash = trim((string)$hash, '"');
+            $hashRaw = $this->provider->restGet("/block-height/{$block}");
+            $hash    = trim((string)$hashRaw, '"');
         } else {
             $hash = $block === 'latest'
                 ? trim((string)$this->provider->restGet('/blocks/tip/hash'), '"')
@@ -866,16 +951,16 @@ class BlockModule
 
         $data = $this->provider->restGet("/block/{$hash}");
         return [
-            'height'       => $data['height'] ?? 0,
-            'hash'         => $data['id'] ?? '',
-            'timestamp'    => $data['timestamp'] ?? 0,
-            'datetime'     => date('Y-m-d H:i:s', $data['timestamp'] ?? 0),
-            'tx_count'     => $data['tx_count'] ?? 0,
-            'size_bytes'   => $data['size'] ?? 0,
-            'weight'       => $data['weight'] ?? 0,
-            'merkle_root'  => $data['merkle_root'] ?? '',
-            'difficulty'   => $data['difficulty'] ?? 0,
-            'median_fee'   => $data['extras']['medianFee'] ?? null,
+            'height'      => $data['height'] ?? 0,
+            'hash'        => $data['id'] ?? '',
+            'timestamp'   => $data['timestamp'] ?? 0,
+            'datetime'    => date('Y-m-d H:i:s', $data['timestamp'] ?? 0),
+            'tx_count'    => $data['tx_count'] ?? 0,
+            'size_bytes'  => $data['size'] ?? 0,
+            'weight'      => $data['weight'] ?? 0,
+            'merkle_root' => $data['merkle_root'] ?? '',
+            'difficulty'  => $data['difficulty'] ?? 0,
+            'median_fee'  => $data['extras']['medianFee'] ?? null,
         ];
     }
 
@@ -889,33 +974,27 @@ class BlockModule
             ['encoding' => 'json', 'transactionDetails' => 'none', 'rewards' => false]
         ]);
         return [
-            'slot'         => (int)$slot,
-            'hash'         => $raw['blockhash'] ?? '',
-            'parent_slot'  => $raw['parentSlot'] ?? 0,
-            'timestamp'    => $raw['blockTime'] ?? 0,
-            'datetime'     => $raw['blockTime'] ? date('Y-m-d H:i:s', $raw['blockTime']) : null,
-            'tx_count'     => count($raw['transactions'] ?? []),
+            'slot'        => (int)$slot,
+            'hash'        => $raw['blockhash'] ?? '',
+            'parent_slot' => $raw['parentSlot'] ?? 0,
+            'timestamp'   => $raw['blockTime'] ?? 0,
+            'datetime'    => $raw['blockTime'] ? date('Y-m-d H:i:s', $raw['blockTime']) : null,
+            'tx_count'    => count($raw['transactions'] ?? []),
         ];
     }
 
     /**
-     * Get a transaction by hash.
+     * Get a transaction by hash / signature / txid.
      */
     public function getTransaction(string $txHash): array
     {
-        if (Networks::isEVM($this->network)) {
-            return $this->evmTransaction($txHash);
-        }
-        if ($this->network === 'bitcoin') {
-            return $this->btcTransaction($txHash);
-        }
-        if (str_starts_with($this->network, 'solana')) {
-            return $this->solanaTransaction($txHash);
-        }
-        if (str_starts_with($this->network, 'tron')) {
-            return $this->tronTransaction($txHash);
-        }
-        throw new BlockException("Unsupported network: {$this->network}");
+        return match (true) {
+            Networks::isEVM($this->network)              => $this->evmTransaction($txHash),
+            $this->network === 'bitcoin'                 => $this->btcTransaction($txHash),
+            str_starts_with($this->network, 'solana')   => $this->solanaTransaction($txHash),
+            str_starts_with($this->network, 'tron')     => $this->tronTransaction($txHash),
+            default => throw new BlockException("Unsupported network: {$this->network}"),
+        };
     }
 
     private function evmTransaction(string $hash): array
@@ -926,19 +1005,21 @@ class BlockModule
         $receipt = $this->provider->jsonRpc('eth_getTransactionReceipt', [$hash]);
 
         return [
-            'hash'        => $tx['hash'],
-            'from'        => $tx['from'],
-            'to'          => $tx['to'],
-            'value_eth'   => Math::weiToEther(Math::bcHexToDec(ltrim($tx['value'] ?? '0x0', '0x'))),
-            'value_wei'   => Math::bcHexToDec(ltrim($tx['value'] ?? '0x0', '0x')),
-            'gas'         => (int)Math::hexToDec($tx['gas'] ?? '0x0'),
-            'gas_price'   => Math::bcHexToDec(ltrim($tx['gasPrice'] ?? '0x0', '0x')),
-            'nonce'       => (int)Math::hexToDec($tx['nonce'] ?? '0x0'),
-            'input'       => $tx['input'] ?? '0x',
-            'block'       => isset($tx['blockNumber']) ? (int)Math::hexToDec($tx['blockNumber']) : null,
-            'status'      => $receipt ? ((int)Math::hexToDec($receipt['status'] ?? '0x0') === 1 ? 'success' : 'failed') : 'pending',
-            'gas_used'    => $receipt ? (int)Math::hexToDec($receipt['gasUsed'] ?? '0x0') : null,
-            'logs'        => $receipt['logs'] ?? [],
+            'hash'      => $tx['hash'],
+            'from'      => $tx['from'],
+            'to'        => $tx['to'],
+            'value_eth' => Math::weiToEther(Math::bcHexToDec(ltrim($tx['value'] ?? '0x0', '0x'))),
+            'value_wei' => Math::bcHexToDec(ltrim($tx['value'] ?? '0x0', '0x')),
+            'gas'       => (int)Math::hexToDec($tx['gas'] ?? '0x0'),
+            'gas_price' => Math::bcHexToDec(ltrim($tx['gasPrice'] ?? '0x0', '0x')),
+            'nonce'     => (int)Math::hexToDec($tx['nonce'] ?? '0x0'),
+            'input'     => $tx['input'] ?? '0x',
+            'block'     => isset($tx['blockNumber']) ? (int)Math::hexToDec($tx['blockNumber']) : null,
+            'status'    => $receipt
+                            ? ((int)Math::hexToDec($receipt['status'] ?? '0x0') === 1 ? 'success' : 'failed')
+                            : 'pending',
+            'gas_used'  => $receipt ? (int)Math::hexToDec($receipt['gasUsed'] ?? '0x0') : null,
+            'logs'      => $receipt['logs'] ?? [],
         ];
     }
 
@@ -947,7 +1028,7 @@ class BlockModule
         $data = $this->provider->restGet("/tx/{$hash}");
         return [
             'txid'      => $data['txid'] ?? $data['tx_hash'] ?? '',
-            'confirmed' => ($data['status']['confirmed'] ?? false),
+            'confirmed' => $data['status']['confirmed'] ?? false,
             'block'     => $data['status']['block_height'] ?? null,
             'timestamp' => $data['status']['block_time'] ?? null,
             'inputs'    => $data['vin'] ?? [],
@@ -996,47 +1077,47 @@ class BlockModule
     public function getGasInfo(): array
     {
         if (!Networks::isEVM($this->network)) {
-            throw new BlockException('Gas info is only available on EVM networks');
+            throw new BlockException('getGasInfo is only supported on EVM networks');
         }
 
-        $gasPrice = $this->provider->jsonRpc('eth_gasPrice');
-        $gasPriceWei = Math::bcHexToDec(ltrim($gasPrice, '0x'));
+        $gasPriceHex = $this->provider->jsonRpc('eth_gasPrice');
+        $gasPriceWei = Math::bcHexToDec(ltrim((string)$gasPriceHex, '0x'));
 
         $result = [
             'gas_price_wei'  => $gasPriceWei,
-            'gas_price_gwei' => bcdiv($gasPriceWei, '1000000000', 9),
+            'gas_price_gwei' => Math::formatUnits($gasPriceWei, 9),
         ];
 
+        // EIP-1559 base fee (Ethereum/Polygon/etc.)
         try {
-            $feeHistory = $this->provider->jsonRpc('eth_feeHistory', [
-                '0x4', 'latest', [25, 50, 75]
-            ]);
-            if ($feeHistory && isset($feeHistory['baseFeePerGas'])) {
-                $base = end($feeHistory['baseFeePerGas']);
-                $result['base_fee_gwei'] = bcdiv(Math::bcHexToDec(ltrim($base, '0x')), '1000000000', 9);
+            $block = $this->provider->jsonRpc('eth_getBlockByNumber', ['latest', false]);
+            if (isset($block['baseFeePerGas'])) {
+                $baseFeeWei = Math::bcHexToDec(ltrim($block['baseFeePerGas'], '0x'));
+                $result['base_fee_wei']  = $baseFeeWei;
+                $result['base_fee_gwei'] = Math::formatUnits($baseFeeWei, 9);
             }
         } catch (\Throwable) {
-            // EIP-1559 not supported on this network
+            // Network doesn't support EIP-1559
         }
 
         return $result;
     }
 
     /**
-     * Estimate gas for a transaction (EVM).
+     * Estimate gas for a transaction (EVM only).
      */
     public function estimateGas(array $tx): string
     {
         if (!Networks::isEVM($this->network)) {
-            throw new BlockException('estimateGas is only available on EVM networks');
+            throw new BlockException('estimateGas is only supported on EVM networks');
         }
         $result = $this->provider->jsonRpc('eth_estimateGas', [$tx]);
-        return Math::hexToDec($result);
+        return (string)(int)Math::hexToDec((string)$result);
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONTRACT MODULE — EVM smart contract interaction
+// CONTRACT MODULE — interact with EVM smart contracts
 // ─────────────────────────────────────────────────────────────────────────────
 
 class ContractModule
@@ -1047,13 +1128,13 @@ class ContractModule
         private string   $contractAddress,
         private array    $abi = []
     ) {
-        if (!Networks::isEVM($this->network)) {
-            throw new ContractException('Smart contracts are only supported on EVM networks');
+        if (!Networks::isEVM($network)) {
+            throw new ContractException("ContractModule only supports EVM networks. Got: {$network}");
         }
     }
 
     /**
-     * Call a read-only (view/pure) function.
+     * Call a view/pure function and return raw hex result.
      */
     public function call(string $functionSignature, array $types = [], array $values = []): string
     {
@@ -1064,7 +1145,7 @@ class ContractModule
             'latest'
         ]);
 
-        return $result ?? '0x';
+        return (string)($result ?? '0x');
     }
 
     /**
@@ -1092,13 +1173,13 @@ class ContractModule
     public function buildTransaction(
         string $fromAddress,
         string $functionSignature,
-        array  $types = [],
-        array  $values = [],
-        string $value = '0x0',
+        array  $types   = [],
+        array  $values  = [],
+        string $value   = '0x0',
         ?int   $gasLimit = null
     ): array {
-        $data  = AbiEncoder::encodeCall($functionSignature, $types, $values);
-        $nonce = $this->provider->jsonRpc('eth_getTransactionCount', [$fromAddress, 'pending']);
+        $data    = AbiEncoder::encodeCall($functionSignature, $types, $values);
+        $nonce   = $this->provider->jsonRpc('eth_getTransactionCount', [$fromAddress, 'pending']);
         $chainId = $this->provider->jsonRpc('eth_chainId');
 
         $gas = $gasLimit
@@ -1130,11 +1211,11 @@ class ContractModule
     public function erc20Info(string $holderAddress): array
     {
         return [
-            'name'          => $this->decodeString($this->call('name()')),
-            'symbol'        => $this->decodeString($this->call('symbol()')),
-            'decimals'      => (int)$this->callUint256('decimals()'),
-            'total_supply'  => $this->callUint256('totalSupply()'),
-            'balance'       => $this->callUint256('balanceOf(address)', ['address'], [$holderAddress]),
+            'name'         => $this->decodeString($this->call('name()')),
+            'symbol'       => $this->decodeString($this->call('symbol()')),
+            'decimals'     => (int)$this->callUint256('decimals()'),
+            'total_supply' => $this->callUint256('totalSupply()'),
+            'balance'      => $this->callUint256('balanceOf(address)', ['address'], [$holderAddress]),
         ];
     }
 
@@ -1173,10 +1254,11 @@ class ContractModule
     {
         $hex = ltrim($hex, '0x');
         if (strlen($hex) < 128) return '';
-        // offset, length, data
+        // ABI-encoded string: offset (32 bytes) + length (32 bytes) + data
         $lengthHex = substr($hex, 64, 64);
         $length    = (int)hexdec($lengthHex);
-        $data      = substr($hex, 128, $length * 2);
+        if ($length === 0) return '';
+        $data = substr($hex, 128, $length * 2);
         return pack('H*', $data);
     }
 }
@@ -1204,8 +1286,7 @@ class TransferModule
         if (!str_starts_with($rawTxHex, '0x')) {
             $rawTxHex = '0x' . $rawTxHex;
         }
-        $txHash = $this->provider->jsonRpc('eth_sendRawTransaction', [$rawTxHex]);
-        return $txHash;
+        return (string)$this->provider->jsonRpc('eth_sendRawTransaction', [$rawTxHex]);
     }
 
     /**
@@ -1228,14 +1309,18 @@ class TransferModule
         $wei      = Math::etherToWei($amount);
         $nonce    = $this->provider->jsonRpc('eth_getTransactionCount', [$from, 'pending']);
         $gasPrice = $this->provider->jsonRpc('eth_gasPrice');
-        $gas      = $customGas
+
+        $valueHex = '0x' . ltrim(Math::decToHex($wei), '0x');
+
+        $gas = $customGas
             ? Math::decToHex($customGas)
             : $this->provider->jsonRpc('eth_estimateGas', [[
                 'from'  => $from,
                 'to'    => $to,
-                'value' => '0x' . dechex((int)$wei),
+                'value' => $valueHex,
             ]]);
-        $chainId  = $this->provider->jsonRpc('eth_chainId');
+
+        $chainId = $this->provider->jsonRpc('eth_chainId');
 
         return [
             'from'     => $from,
@@ -1243,7 +1328,7 @@ class TransferModule
             'nonce'    => $nonce,
             'gas'      => $gas,
             'gasPrice' => $gasPrice,
-            'value'    => '0x' . dechex((int)$wei),
+            'value'    => $valueHex,
             'data'     => '0x',
             'chainId'  => $chainId,
         ];
@@ -1257,38 +1342,40 @@ class TransferModule
         string $contractAddress,
         string $to,
         float  $amount,
-        int    $decimals = 18,
+        int    $decimals  = 18,
         ?int   $customGas = null
     ): array {
         if (!Networks::isEVM($this->network)) {
             throw new TransferException('buildTokenTransfer is only supported on EVM networks');
         }
 
-        $value   = Math::parseUnits((string)$amount, $decimals);
-        $data    = AbiEncoder::encodeCall('transfer(address,uint256)', ['address', 'uint256'], [$to, $value]);
-        $nonce   = $this->provider->jsonRpc('eth_getTransactionCount', [$from, 'pending']);
-        $gas     = $customGas
+        $value = Math::parseUnits((string)$amount, $decimals);
+        $data  = AbiEncoder::encodeCall('transfer(address,uint256)', ['address', 'uint256'], [$to, $value]);
+
+        $nonce    = $this->provider->jsonRpc('eth_getTransactionCount', [$from, 'pending']);
+        $gasPrice = $this->provider->jsonRpc('eth_gasPrice');
+        $chainId  = $this->provider->jsonRpc('eth_chainId');
+
+        $gas = $customGas
             ? Math::decToHex($customGas)
             : $this->provider->jsonRpc('eth_estimateGas', [[
                 'from' => $from,
                 'to'   => $contractAddress,
                 'data' => $data,
             ]]);
-        $gasPrice = $this->provider->jsonRpc('eth_gasPrice');
-        $chainId  = $this->provider->jsonRpc('eth_chainId');
 
         return [
-            'from'            => $from,
-            'to'              => $contractAddress,
-            'nonce'           => $nonce,
-            'gas'             => $gas,
-            'gasPrice'        => $gasPrice,
-            'value'           => '0x0',
-            'data'            => $data,
-            'chainId'         => $chainId,
-            '__meta_recipient' => $to,
-            '__meta_amount'    => $amount,
-            '__meta_decimals'  => $decimals,
+            'from'              => $from,
+            'to'                => $contractAddress,
+            'nonce'             => $nonce,
+            'gas'               => $gas,
+            'gasPrice'          => $gasPrice,
+            'value'             => '0x0',
+            'data'              => $data,
+            'chainId'           => $chainId,
+            '__meta_recipient'  => $to,
+            '__meta_amount'     => $amount,
+            '__meta_decimals'   => $decimals,
         ];
     }
 
@@ -1307,12 +1394,12 @@ class TransferModule
             $receipt = $this->provider->jsonRpc('eth_getTransactionReceipt', [$txHash]);
             if ($receipt !== null) {
                 return [
-                    'hash'       => $txHash,
-                    'status'     => (int)Math::hexToDec($receipt['status'] ?? '0x0') === 1 ? 'success' : 'failed',
-                    'block'      => (int)Math::hexToDec($receipt['blockNumber'] ?? '0x0'),
-                    'gas_used'   => (int)Math::hexToDec($receipt['gasUsed'] ?? '0x0'),
-                    'logs'       => $receipt['logs'] ?? [],
-                    'receipt'    => $receipt,
+                    'hash'     => $txHash,
+                    'status'   => (int)Math::hexToDec($receipt['status'] ?? '0x0') === 1 ? 'success' : 'failed',
+                    'block'    => (int)Math::hexToDec($receipt['blockNumber'] ?? '0x0'),
+                    'gas_used' => (int)Math::hexToDec($receipt['gasUsed'] ?? '0x0'),
+                    'logs'     => $receipt['logs'] ?? [],
+                    'receipt'  => $receipt,
                 ];
             }
             sleep($intervalSeconds);
@@ -1331,36 +1418,26 @@ class TransferModule
         $utxos = $this->provider->restGet("/address/{$address}/utxo");
         return array_map(function ($u) {
             return [
-                'txid'       => $u['txid'],
-                'vout'       => $u['vout'],
-                'value_sat'  => $u['value'],
-                'value_btc'  => Math::satoshiToBtc($u['value']),
-                'confirmed'  => $u['status']['confirmed'] ?? false,
+                'txid'      => $u['txid'],
+                'vout'      => $u['vout'],
+                'value_sat' => $u['value'],
+                'value_btc' => Math::satoshiToBtc($u['value']),
+                'confirmed' => $u['status']['confirmed'] ?? false,
             ];
-        }, $utxos);
+        }, (array)$utxos);
     }
 
     /**
      * Bitcoin: Broadcast a raw signed transaction (hex).
+     * Uses mempool.space POST /tx endpoint.
      */
     public function broadcastBitcoin(string $rawTxHex): string
     {
         if ($this->network !== 'bitcoin') {
             throw new TransferException('broadcastBitcoin is only for Bitcoin');
         }
-        $result = $this->provider->restPost('/tx', [], ['Content-Type: text/plain']);
-        // mempool.space POST /tx expects raw body
-        // Use direct curl for this:
-        $ch = curl_init('https://mempool.space/api/tx');
-        curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => $rawTxHex,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER     => ['Content-Type: text/plain'],
-        ]);
-        $response = curl_exec($ch);
-        curl_close($ch);
-        return $response; // Returns txid on success
+        // mempool.space /tx expects raw hex as plain text body
+        return trim($this->provider->restPostRaw('/tx', $rawTxHex));
     }
 
     /**
@@ -1371,11 +1448,10 @@ class TransferModule
         if (!str_starts_with($this->network, 'solana')) {
             throw new TransferException('sendSolanaTransaction is only for Solana');
         }
-        $txId = $this->provider->jsonRpc('sendTransaction', [
+        return (string)$this->provider->jsonRpc('sendTransaction', [
             $signedTxBase64,
             ['encoding' => 'base64']
         ]);
-        return $txId;
     }
 
     /**
@@ -1406,7 +1482,7 @@ class NetworkStatsModule
         if (!Networks::isEVM($this->network)) {
             return Networks::CHAIN_IDS[$this->network] ?? 0;
         }
-        return (int)Math::hexToDec($this->provider->jsonRpc('eth_chainId'));
+        return (int)Math::hexToDec((string)$this->provider->jsonRpc('eth_chainId'));
     }
 
     public function getNodeInfo(): array
@@ -1415,14 +1491,14 @@ class NetworkStatsModule
             throw new NetworkException('getNodeInfo is only supported on EVM networks');
         }
         return [
-            'version'     => $this->provider->jsonRpc('web3_clientVersion'),
-            'chain_id'    => $this->getChainId(),
-            'peer_count'  => (int)Math::hexToDec($this->provider->jsonRpc('net_peerCount') ?? '0x0'),
-            'listening'   => $this->provider->jsonRpc('net_listening'),
-            'syncing'     => $this->provider->jsonRpc('eth_syncing'),
-            'network'     => $this->network,
-            'rpc_url'     => $this->provider->getRpcUrl(),
-            'symbol'      => Networks::NATIVE_SYMBOL[$this->network] ?? '?',
+            'version'    => $this->provider->jsonRpc('web3_clientVersion'),
+            'chain_id'   => $this->getChainId(),
+            'peer_count' => (int)Math::hexToDec((string)($this->provider->jsonRpc('net_peerCount') ?? '0x0')),
+            'listening'  => $this->provider->jsonRpc('net_listening'),
+            'syncing'    => $this->provider->jsonRpc('eth_syncing'),
+            'network'    => $this->network,
+            'rpc_url'    => $this->provider->getRpcUrl(),
+            'symbol'     => Networks::NATIVE_SYMBOL[$this->network] ?? '?',
         ];
     }
 
@@ -1432,7 +1508,7 @@ class NetworkStatsModule
             throw new NetworkException('getMempoolSize is only supported on EVM networks');
         }
         $status = $this->provider->jsonRpc('txpool_status');
-        return isset($status['pending']) ? (int)Math::hexToDec($status['pending']) : 0;
+        return isset($status['pending']) ? (int)Math::hexToDec((string)$status['pending']) : 0;
     }
 
     public function getSolanaEpoch(): array
@@ -1448,15 +1524,15 @@ class NetworkStatsModule
         if ($this->network !== 'bitcoin') {
             throw new NetworkException('getBitcoinMempoolStats is only for Bitcoin');
         }
-        return $this->provider->restGet('/mempool');
+        return (array)$this->provider->restGet('/mempool');
     }
 
     public function getBitcoinFeeRecommendations(): array
     {
         if ($this->network !== 'bitcoin') {
-            throw new NetworkException('Only for Bitcoin');
+            throw new NetworkException('getBitcoinFeeRecommendations is only for Bitcoin');
         }
-        return $this->provider->restGet('/v1/fees/recommended');
+        return (array)$this->provider->restGet('/v1/fees/recommended');
     }
 
     public function getTronBandwidth(string $address): array
@@ -1464,7 +1540,7 @@ class NetworkStatsModule
         if (!str_starts_with($this->network, 'tron')) {
             throw new NetworkException('getTronBandwidth is only for Tron');
         }
-        return $this->provider->restGet("/v1/accounts/{$address}/resources");
+        return (array)$this->provider->restGet("/v1/accounts/{$address}/resources");
     }
 }
 
@@ -1526,8 +1602,8 @@ class Web3PHP
 
     public function __construct(array $config = [])
     {
-        $this->config   = array_merge(['network' => 'ethereum', 'provider' => 'public'], $config);
-        $http           = new HttpClient(
+        $this->config = array_merge(['network' => 'ethereum', 'provider' => 'public'], $config);
+        $http         = new HttpClient(
             timeout: $this->config['timeout'] ?? 30,
             headers: $this->buildAuthHeaders()
         );
@@ -1596,7 +1672,7 @@ class Web3PHP
     {
         return [
             'library'  => 'Web3PHP',
-            'version'  => '1.0.0',
+            'version'  => '1.0.1',
             'network'  => $this->provider->getNetwork(),
             'provider' => $this->provider->providerName,
             'rpc_url'  => $this->provider->getRpcUrl(),

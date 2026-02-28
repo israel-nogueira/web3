@@ -1,0 +1,56 @@
+CORREÇÕES MANUAIS — src/FakeChain.php
+======================================
+
+São dois lugares com o mesmo erro: PHP não permite chamar funções
+(str_repeat, etc.) em valores padrão de propriedades ou parâmetros.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CORREÇÃO 1 — Propriedade da classe FakeChain (≈ linha 402)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ANTES (linha ~402):
+    public string $minerAddress = '0x' . str_repeat('f', 40);
+
+DEPOIS:
+    public string $minerAddress = '0xffffffffffffffffffffffffffffffffffffffff';
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CORREÇÃO 2 — Parâmetro padrão do método Ledger::mine()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ANTES:
+    public function mine(string $minerAddress = '0x' . '0' . str_repeat('1', 39)): array
+
+DEPOIS:
+    public function mine(string $minerAddress = '0x0111111111111111111111111111111111111111'): array
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPÇÃO AUTOMÁTICA — rodar o script de patch
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Copie fix_fakechain.php para a raiz do projeto e execute:
+
+    php fix_fakechain.php
+
+O script faz backup automático (FakeChain.php.bak) antes de alterar.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXPLICAÇÃO DO ERRO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHP exige que valores padrão de propriedades de classe e parâmetros
+de métodos sejam "expressões constantes" — ou seja, valores que o
+compilador consiga avaliar em tempo de compilação, sem executar código.
+
+Não permitido:
+    public string $x = '0x' . str_repeat('f', 40);  // ← chamada de função
+    public string $x = 'a' . 'b' . str_repeat(...);  // ← idem
+
+Permitido:
+    public string $x = '0xffffffffffffffffffffffffffffffffffffffff';  // literal
+    public string $x = '0x' . 'ff';  // concatenação de literais
+    public const  X  = '0xff';       // constante (pode usar em propriedades)
