@@ -8,15 +8,14 @@
     "require": {
         "php": ">=8.1",
         "ext-curl": "*",
-        "ext-json": "*"
+        "ext-json": "*",
+        "ext-bcmath": "*",
+        "ext-gmp": "*",
+        "kornrunner/keccak": "^0.2",
+        "simplito/elliptic-php": "^1.0"
     },
     "require-dev": {
         "phpunit/phpunit": "^10.0"
-    },
-    "suggest": {
-        "ext-bcmath": "Recomendado para aritmética de precisão com saldos e unidades grandes",
-        "kornrunner/keccak": "Necessário para endereços EIP-55 checksum e ABI encoding correto: composer require kornrunner/keccak",
-        "kornrunner/ethereum-offline-raw-tx": "Necessário para assinar transações EVM no servidor"
     },
     "autoload": {
         "psr-4": {
