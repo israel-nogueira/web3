@@ -6,16 +6,12 @@
  * BIP39 + BIP44 HD Wallets — standalone, Web3PHP e FakeChain.
  * Funciona 100% offline.
  *
- * Requer:
- *   composer require kornrunner/keccak simplito/elliptic-php
+ * Instalação:
+ *   composer require web3php/web3php
  *
  * Rodar:
  *   php exemplo_mnemonic.php
  */
-
-require_once __DIR__ . '/vendor/autoload.php';
-require_once __DIR__ . '/src/MnemonicWallet.php';
-require_once __DIR__ . '/src/FakeChain.php';
 
 use Web3PHP\MnemonicWallet;
 use FakeChain\FakeChainHD;
@@ -180,7 +176,6 @@ try {
     echo "❌ {$e->getMessage()}\n\n";
 }
 
-// Erro esperado: mnemônica inválida
 try {
     $mn->importMnemonic('palavra invalida aqui mesmo nao existe nada abc');
 } catch (\InvalidArgumentException $e) {
@@ -339,7 +334,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "14. INTEGRAÇÃO WEB3PHP (via MnemonicTrait)\n";
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
 
-// Para ativar, adicione `use MnemonicTrait;` na classe Web3PHP e use assim:
+// Para ativar, adicione `use MnemonicTrait;` na classe Web3PHP:
+//
+//   use Web3PHP\Web3PHP;
 //
 //   $eth = new Web3PHP(['network' => 'ethereum', 'provider' => 'infura', 'api_key' => '...']);
 //   $hdWallet = $eth->createHDWallet();              // gera mnemônica + deriva index 0
