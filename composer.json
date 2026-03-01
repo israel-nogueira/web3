@@ -18,8 +18,11 @@
         "ext-bcmath": "*",
         "ext-gmp": "*",
         "ext-hash": "*",
+
         "kornrunner/keccak": "^0.2",
-        "simplito/elliptic-php": "^1.0"
+        "simplito/elliptic-php": "^1.0",
+
+        "kornrunner/ethereum-offline-raw-tx": "^0.3"
     },
     "require-dev": {
         "phpunit/phpunit": "^10.0"
